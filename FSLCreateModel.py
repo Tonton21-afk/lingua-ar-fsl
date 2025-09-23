@@ -2,6 +2,7 @@ import os, cv2, time, math, random
 import numpy as np
 import pandas as pd
 import mediapipe as mp
+from collections import deque
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, multilabel_confusion_matrix
@@ -30,7 +31,6 @@ def mediapipe_detection(image, model):
     return cv2.cvtColor(image, cv2.COLOR_RGB2BGR), results
 
 def extract_keypoints(results):
-    # Ensure float32 to reduce disk/RAM footprint
     pose = (np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark],
                      dtype=np.float32).flatten() if results.pose_landmarks else np.zeros(33*4, dtype=np.float32))
     face = (np.array([[res.x, res.y, res.z] for res in results.face_landmarks.landmark],
@@ -47,7 +47,7 @@ class SignLanguageProcessor:
         self.mp_data_path = mp_data_path
         self.actions = []
         self.model = None
-        self.sequence_length = 30  # frames per sequence
+        self.sequence_length = 30
 
     def detect_actions_from_folders(self):
         self.actions = [d for d in os.listdir(self.data_path) if os.path.isdir(os.path.join(self.data_path, d))]
@@ -74,7 +74,7 @@ class SignLanguageProcessor:
                 continue
             video_files = [f for f in os.listdir(video_dir) if f.endswith(('.mp4','.avi','.mov','.mkv','.MP4','.webm'))]
             log(f"Processing {len(video_files)} videos for {action}")
-            for idx, vf in enumerate(video_files[:1000]):  # cap 1000
+            for idx, vf in enumerate(video_files[:1000]):
                 cap = cv2.VideoCapture(os.path.join(video_dir, vf))
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 if total_frames == 0:
@@ -97,10 +97,6 @@ class SignLanguageProcessor:
         return True
 
     def _discover_ids_for_action(self, action):
-        """
-        Discover actual video ids for an action by looking at frame 0 folder.
-        We sort ids and cap at 1000 to ensure indices are valid and consistent.
-        """
         frame0 = os.path.join(self.mp_data_path, action, '0')
         if not os.path.exists(frame0):
             return []
@@ -111,32 +107,24 @@ class SignLanguageProcessor:
                 try:
                     ids.append(int(name))
                 except ValueError:
-                    # if filename isn't an int id, skip it safely
                     continue
         ids.sort()
         if len(ids) > 1000:
-            ids = ids[:1000]  # hard cap as per your workflow
+            ids = ids[:1000]
         return ids
 
     def prepare_training_data(self):
-        """
-        OOM-safe + resume/skip-ready:
-        - Uses SSD memmaps
-        - Skips entirely if memmaps are already complete
-        - Resumes if partially filled
-        - Rebuilds if dataset size changed
-        - Prints clear progress
-        Returns:
-            X_path (str), y_cat (np.ndarray), train_idx (np.ndarray), test_idx (np.ndarray)
-        """
-        if not self.actions:
+        if len(self.actions) == 0:
             self.detect_actions_from_folders()
+            if len(self.actions) == 0:
+                log("No actions found for training!")
+                return None, None, None, None
+        
         label_map = {label: i for i, label in enumerate(self.actions)}
 
-        # 1) Discover actual video IDs per action (cap 1000) and expected total
         action_to_ids, total_expected = {}, 0
         for action in self.actions:
-            ids = self._discover_ids_for_action(action)  # sorted list of ints, <= 1000
+            ids = self._discover_ids_for_action(action)
             action_to_ids[action] = ids
             total_expected += len(ids)
 
@@ -148,7 +136,6 @@ class SignLanguageProcessor:
         y_path = os.path.join(self.mp_data_path, "y_memmap.npy")
 
         def _allocate_new_memmaps():
-            # fresh allocate with sentinel -1 for y so we can resume
             X_mm = np.lib.format.open_memmap(
                 X_path, dtype=np.float32, mode='w+',
                 shape=(total_expected, self.sequence_length, 1662)
@@ -160,18 +147,15 @@ class SignLanguageProcessor:
             y_mm[:] = -1
             return X_mm, y_mm
 
-        # 2) Decide: skip / resume / rebuild
         rebuild = False
         if os.path.exists(X_path) and os.path.exists(y_path):
             try:
                 X = np.load(X_path, mmap_mode="r+")
                 y = np.load(y_path, mmap_mode="r+")
-                # shape check (dataset might have grown/shrunk)
                 if X.shape != (total_expected, self.sequence_length, 1662) or y.shape != (total_expected,):
                     log("Memmap shapes mismatch current dataset — rebuilding memmaps...")
                     rebuild = True
                 else:
-                    # check completeness: if no -1 left in y, we can SKIP quickly
                     if np.all(y >= 0):
                         log("Dataset already prepared — skipping Step 3 (using existing memmaps).")
                         y_cat = to_categorical(y, num_classes=len(self.actions))
@@ -185,7 +169,6 @@ class SignLanguageProcessor:
                 rebuild = True
 
             if rebuild:
-                # remove old and reallocate to avoid shape/size conflicts
                 try:
                     os.remove(X_path)
                 except Exception:
@@ -196,15 +179,11 @@ class SignLanguageProcessor:
                     pass
                 X, y = _allocate_new_memmaps()
         else:
-            # no existing memmaps → fresh allocate
             X, y = _allocate_new_memmaps()
 
-        # 3) Fill loop (resume-aware): continue from first -1 index
-        #    This quick scan is cheap compared to full data prep.
         try:
             start_idx = int(np.argmax(y == -1)) if np.any(y == -1) else y.shape[0]
         except Exception:
-            # Fallback if y contains no -1 sentinel for some reason
             start_idx = int(np.count_nonzero(y >= 0))
 
         idx = start_idx
@@ -212,7 +191,6 @@ class SignLanguageProcessor:
             n = len(ids)
             log(f"Preparing data for {n} videos of action: {action}")
             for i, vid in enumerate(ids):
-                # If we’re resuming and this slot is already filled, skip
                 if idx < y.shape[0] and y[idx] != -1:
                     idx += 1
                     continue
@@ -222,7 +200,7 @@ class SignLanguageProcessor:
                     npy_path = os.path.join(self.mp_data_path, action, str(pos), f"{vid}.npy")
                     try:
                         res = np.load(npy_path, allow_pickle=False).astype(np.float32, copy=False)
-                        if res.size != 1662:  # defensive
+                        if res.size != 1662:
                             fixed = np.zeros(1662, dtype=np.float32)
                             fixed[:min(1662, res.size)] = res[:min(1662, res.size)]
                             res = fixed
@@ -237,7 +215,6 @@ class SignLanguageProcessor:
                 if ((i + 1) % 100 == 0) or ((i + 1) == n):
                     log(f"  Processed {i+1}/{n} videos")
 
-        # 4) Build one-hot labels & split indices (RAM-cheap)
         y_cat = to_categorical(y, num_classes=len(self.actions))
         idxs = np.arange(total_expected)
         train_idx, test_idx = train_test_split(idxs, test_size=0.05, random_state=42)
@@ -246,8 +223,15 @@ class SignLanguageProcessor:
         return X_path, y_cat, train_idx, test_idx
 
 
-
     def build_model(self):
+        if len(self.actions) == 0:
+            self.detect_actions_from_folders()
+            if len(self.actions) == 0:
+                log("No actions found for model building!")
+                return None
+        
+        log(f"Building model for {len(self.actions)} actions")
+        
         model = Sequential([
             LSTM(64, return_sequences=True, activation='relu', input_shape=(self.sequence_length, 1662)),
             LSTM(128, return_sequences=True, activation='relu'),
@@ -262,19 +246,10 @@ class SignLanguageProcessor:
         return model
 
     def train_model(self, X_path, y_cat, train_idx, test_idx, epochs=200, batch_size=32):
-        """
-        RAM-safe, SSD-streaming training:
-        - Uses a Keras Sequence to load batches directly from memmap on disk
-        - Shuffles each epoch
-        - Keeps TensorBoard, EarlyStopping, and ModelCheckpoint
-        - Maintains identical model/metrics behavior
-        """
-
-        # Load memmap and infer dims so we don't rely on outer attributes inside inner class
         X_mem = np.load(X_path, mmap_mode='r')
         y_cat = np.asarray(y_cat)
-        seq_len  = X_mem.shape[1]   # e.g., 30
-        feat_dim = X_mem.shape[2]   # 1662
+        seq_len  = X_mem.shape[1]
+        feat_dim = X_mem.shape[2]
 
         class DiskSequence(Sequence):
             def __init__(self, indices, batch_size, seq_len, feat_dim):
@@ -293,10 +268,9 @@ class SignLanguageProcessor:
                 end = min(start + self.batch_size, self.n)
                 batch_inds = self.indices[start:end]
 
-                # Allocate batch on the fly, read straight from memmap
                 bx = np.empty((len(batch_inds), self.seq_len, self.feat_dim), dtype=np.float32)
                 for j, ix in enumerate(batch_inds):
-                    bx[j] = X_mem[ix]  # memmap slice -> no giant RAM copy of the whole dataset
+                    bx[j] = X_mem[ix]
 
                 by = y_cat[batch_inds]
                 return bx, by
@@ -307,13 +281,12 @@ class SignLanguageProcessor:
         train_seq = DiskSequence(train_idx, batch_size, seq_len, feat_dim)
         val_seq   = DiskSequence(test_idx,  batch_size, seq_len, feat_dim)
 
-        # Timestamped log dir per run
         run_stamp = time.strftime("%Y%m%d-%H%M%S")
         log_dir = os.path.join(self.mp_data_path, 'logs', run_stamp)
         os.makedirs(log_dir, exist_ok=True)
 
         tb = TensorBoard(log_dir=log_dir)
-        early_stop = EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True)
+        early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
         checkpoint = ModelCheckpoint(
             os.path.join(self.mp_data_path, 'best_fsl_model.h5'),
             save_best_only=True,
@@ -326,8 +299,11 @@ class SignLanguageProcessor:
             train_seq,
             epochs=epochs,
             validation_data=val_seq,
-            callbacks=[tb, early_stop, checkpoint],
-            verbose=1
+            callbacks=[tb, checkpoint],
+            verbose=1,
+            workers=0,
+            use_multiprocessing=False,
+            max_queue_size=10
         )
         log("Training complete")
         return hist
@@ -335,22 +311,15 @@ class SignLanguageProcessor:
 
 
     def evaluate_model(self, X_path, y_cat, test_idx, batch_size=32):
-        """
-        OOM-safe evaluation:
-        - Loads test sequences in small batches from SSD (memmap)
-        - Computes predictions batch by batch
-        - Returns accuracy without ever loading the full test set into RAM
-        """
         X = np.load(X_path, mmap_mode='r')
         y_true = []
         y_pred = []
 
-        # process test set in small chunks
         for start in range(0, len(test_idx), batch_size):
             end = start + batch_size
             batch_idx = test_idx[start:end]
 
-            X_batch = X[batch_idx]           # only this slice loaded into RAM
+            X_batch = X[batch_idx]
             y_batch = y_cat[batch_idx]
 
             preds = self.model.predict(X_batch, verbose=0)
@@ -372,15 +341,102 @@ class SignLanguageProcessor:
         self.model = load_model(path)
         log(f"Model loaded from {path}")
         return self.model
+    
+    def run_realtime(self, model_path='None', prob_threshold=0.60, show_fps=True):
+        if self.model is None:
+            if model_path:
+                try:
+                    self.model = load_model(model_path)
+                    log(f"Loaded model for realtime from: {model_path}")
+                except Exception as e:
+                    log(f"Failed to load model at {model_path}: {e}")
+                    return
+            else:
+                log("No model in memory. Load or train a model first.")
+                return
 
+        if not self.actions:
+            self.detect_actions_from_folders()
+            if not self.actions:
+                log("No actions found. Cannot label predictions.")
+                return
+
+        from collections import deque
+        window = deque(maxlen=self.sequence_length)
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            log("Cannot open webcam.")
+            return
+
+        prev_time = time.time()
+        fps = 0.0
+
+        with mp_holistic.Holistic(
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        ) as holistic:
+
+            log("Realtime recognition started. Press 'q' to quit.")
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                image, results = mediapipe_detection(frame, holistic)
+                keypoints = extract_keypoints(results)
+                window.append(keypoints)
+
+                if results.pose_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
+                if results.left_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                if results.right_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+
+                label_text = "…"
+                if len(window) == self.sequence_length:
+                    seq = np.expand_dims(np.array(window, dtype=np.float32), axis=0)
+                    probs = self.model.predict(seq, verbose=0)[0]
+                    top_idx = int(np.argmax(probs))
+                    top_prob = float(probs[top_idx])
+
+                    if top_prob >= prob_threshold:
+                        label_text = f"{self.actions[top_idx]}  ({top_prob*100:.1f}%)"
+                    else:
+                        label_text = f"Unsure ({top_prob*100:.1f}%)"
+
+                if show_fps:
+                    now = time.time()
+                    dt = now - prev_time
+                    prev_time = now
+                    fps = 1.0 / dt if dt > 0 else fps
+                    cv2.putText(image, f"FPS: {fps:.1f}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                cv2.rectangle(image, (10, 50), (650, 90), (0, 0, 0), -1)
+                cv2.putText(image, label_text, (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+                cv2.imshow("FSL Realtime Recognition", image)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        cap.release()
+        cv2.destroyAllWindows()
+        log("Realtime recognition ended.")
+        
 def main():
-    DATA_PATH = r"C:\FSL Model\Filipino_Sign_Data_Complete"
-    MP_DATA_PATH = r"C:\FSL Model\MP_DATA"
+    DATA_PATH = r"C:\Users\zhyrex\Desktop\cloning\Filipino_Sign_Data_Complete"
+    MP_DATA_PATH = r"C:\Users\zhyrex\Desktop\cloning\MP_Data"
     processor = SignLanguageProcessor(DATA_PATH, MP_DATA_PATH)
     X_path = y_cat = train_idx = test_idx = None
 
     while True:
-        print("\n1.Setup  2.Process  3.Prepare  4.Build  5.Train  6.Eval  7.Save  8.Load  0.Exit")
+        print("\n1.Setup  2.Process  3.Prepare  4.Build  5.Train  6.Eval  7.Save  8.Load  9.Realtime  0.Exit")
         c = input("Choice: ").strip()
         if c == '0':
             break
@@ -394,7 +450,6 @@ def main():
             processor.build_model()
         elif c == '5':
             if processor.model and X_path:
-                # Ask epochs interactively to keep parity with your old UX
                 try:
                     e_raw = input("Enter number of epochs (default: 200): ").strip()
                     epochs = int(e_raw) if e_raw.isdigit() else 200
@@ -409,13 +464,15 @@ def main():
             else:
                 log("Train first")
         elif c == '7':
-            name = input("Enter model name (default: sign_language_model.h5): ").strip()
-            name = name if name else 'sign_language_model.h5'
+            name = input("Enter model name (default: best_fsl_model.h5): ").strip()
+            name = name if name else 'best_fsl_model.h5'
             processor.save_model(name)
         elif c == '8':
-            name = input("Enter model name (default: sign_language_model.h5): ").strip()
-            name = name if name else 'sign_language_model.h5'
+            name = input("Enter model name (default: best_fsl_model.h5): ").strip()
+            name = name if name else 'best_fsl_model.h5'
             processor.load_model(name)
+        elif c == '9':
+            processor.run_realtime()
 
 if __name__ == "__main__":
     main()

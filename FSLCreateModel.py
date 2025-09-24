@@ -6,18 +6,21 @@ from collections import deque
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, multilabel_confusion_matrix
-
+import re
 from tensorflow.keras.utils import to_categorical, Sequence
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.callbacks import (
     TensorBoard, EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 )
-
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
 mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
 
+def natural_key(s: str):
+    # Example: "10" -> [10], "A" -> ["a"], "2B" -> [2, "b"]
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
 def log(msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -63,25 +66,41 @@ class SignLanguageProcessor:
         log(f"Setup completed for {len(self.actions)} actions")
         return True
 
+
     def process_videos(self):
         if not self.actions:
             self.detect_actions_from_folders()
+        self.actions = sorted(self.actions, key=natural_key)
+
         for action in self.actions:
             video_dir = os.path.join(self.data_path, action)
-            data_dir = os.path.join(self.mp_data_path, action)
+            data_dir  = os.path.join(self.mp_data_path, action)
             if not os.path.isdir(video_dir):
                 log(f"Warning: Missing video directory for action '{action}', skipping.")
                 continue
-            video_files = [f for f in os.listdir(video_dir) if f.endswith(('.mp4','.avi','.mov','.mkv','.MP4','.webm'))]
+
+            video_files = sorted(
+                [f for f in os.listdir(video_dir)
+                if f.lower().endswith(('.mp4','.avi','.mov','.mkv','.webm'))],
+                key=natural_key
+            )
             log(f"Processing {len(video_files)} videos for {action}")
-            for idx, vf in enumerate(video_files[:1000]):
-                cap = cv2.VideoCapture(os.path.join(video_dir, vf))
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                if total_frames == 0:
-                    cap.release()
-                    continue
-                frame_idx = np.linspace(0, total_frames-1, self.sequence_length, dtype=int)
-                with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+
+            # one Holistic per action (faster)
+            with mp_holistic.Holistic(
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            ) as holistic:
+
+                for idx, vf in enumerate(video_files[:1000]):
+                    cap_path = os.path.join(video_dir, vf)
+                    cap = cv2.VideoCapture(cap_path)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    if total_frames == 0:
+                        cap.release()
+                        continue
+
+                    frame_idx = np.linspace(0, total_frames-1, self.sequence_length, dtype=int)
                     for pos, fi in enumerate(frame_idx):
                         cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
                         ret, frame = cap.read()
@@ -90,28 +109,14 @@ class SignLanguageProcessor:
                         _, results = mediapipe_detection(frame, holistic)
                         keypoints = extract_keypoints(results)
                         np.save(os.path.join(data_dir, str(pos), f"{idx}.npy"), keypoints)
-                cap.release()
-                if (idx + 1) % 100 == 0:
-                    log(f"{action}: processed {idx+1}/{min(len(video_files),1000)} videos")
+
+                    cap.release()
+
+                    if (idx + 1) % 100 == 0:
+                        log(f"{action}: processed {idx+1}/{min(len(video_files),1000)} videos")
+
         log("Finished processing all videos!")
         return True
-
-    def _discover_ids_for_action(self, action):
-        frame0 = os.path.join(self.mp_data_path, action, '0')
-        if not os.path.exists(frame0):
-            return []
-        ids = []
-        for f in os.listdir(frame0):
-            if f.endswith('.npy'):
-                name, _ = os.path.splitext(f)
-                try:
-                    ids.append(int(name))
-                except ValueError:
-                    continue
-        ids.sort()
-        if len(ids) > 1000:
-            ids = ids[:1000]
-        return ids
 
     def prepare_training_data(self):
         if len(self.actions) == 0:
@@ -119,7 +124,15 @@ class SignLanguageProcessor:
             if len(self.actions) == 0:
                 log("No actions found for training!")
                 return None, None, None, None
-        
+
+        # 🔥 ensure deterministic, numeric-aware order
+        self.actions = sorted(self.actions, key=natural_key)
+
+        # 🔥 persist actions order for inference/reload
+        order_path = os.path.join(self.mp_data_path, "actions_order.txt")
+        with open(order_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.actions))
+
         label_map = {label: i for i, label in enumerate(self.actions)}
 
         action_to_ids, total_expected = {}, 0
@@ -169,14 +182,10 @@ class SignLanguageProcessor:
                 rebuild = True
 
             if rebuild:
-                try:
-                    os.remove(X_path)
-                except Exception:
-                    pass
-                try:
-                    os.remove(y_path)
-                except Exception:
-                    pass
+                try: os.remove(X_path)
+                except Exception: pass
+                try: os.remove(y_path)
+                except Exception: pass
                 X, y = _allocate_new_memmaps()
         else:
             X, y = _allocate_new_memmaps()
@@ -221,6 +230,7 @@ class SignLanguageProcessor:
 
         log(f"Prepared {total_expected} sequences across {len(self.actions)} actions")
         return X_path, y_cat, train_idx, test_idx
+
 
 
     def build_model(self):
@@ -339,8 +349,48 @@ class SignLanguageProcessor:
     def load_model(self, model_name='sign_language_model.h5'):
         path = os.path.join(self.mp_data_path, model_name)
         self.model = load_model(path)
+        order_path = os.path.join(self.mp_data_path, "actions_order.txt")
+        if os.path.exists(order_path):
+            with open(order_path, "r", encoding="utf-8") as f:
+                self.actions = [ln.strip() for ln in f if ln.strip()]
+            log(f"Loaded actions order ({len(self.actions)} classes).")
+        else:
+            self.detect_actions_from_folders()
+            log("WARNING: actions_order.txt missing; using folder order (may mismatch).")
+        # sanity: model outputs must match class count
+        out_units = int(self.model.output_shape[-1])
+        if out_units != len(self.actions):
+            log(f"ERROR: model outputs {out_units} classes but actions has {len(self.actions)}. Rebuild with consistent order.")
         log(f"Model loaded from {path}")
         return self.model
+    
+    def dbg_check_model_vs_actions(self):
+        if self.model is None:
+            log("No model loaded."); return
+        out_units = int(self.model.output_shape[-1])
+        log(f"Model output units: {out_units}, actions: {len(self.actions)}")
+        if out_units != len(self.actions):
+            log("❌ Mismatch — labels/order problem.")
+
+    def dbg_label_distribution(self):
+        y_path = os.path.join(self.mp_data_path, "y_memmap.npy")
+        if not os.path.exists(y_path):
+            log("y_memmap.npy not found. Run 3.Prepare first."); return
+        y = np.load(y_path, mmap_mode="r")
+        vals, cnts = np.unique(y, return_counts=True)
+        log(f"Labels present: {vals.tolist()}")
+        log(f"Counts per label: {cnts.tolist()}")
+
+    def dbg_data_health(self):
+        X_path = os.path.join(self.mp_data_path, "X_memmap.npy")
+        if not os.path.exists(X_path):
+            log("X_memmap.npy not found. Run 3.Prepare first."); return
+        X = np.load(X_path, mmap_mode="r")
+        nz = np.count_nonzero(X)
+        frac = nz / X.size
+        log(f"X shape: {X.shape}, mean={float(X.mean()):.4f}, std={float(X.std()):.4f}, nonzero_frac={frac:.6f}")
+
+
     
     def run_realtime(self, model_path='None', prob_threshold=0.60, show_fps=True):
         if self.model is None:
@@ -372,12 +422,19 @@ class SignLanguageProcessor:
         prev_time = time.time()
         fps = 0.0
 
+        # smoothing + logging state
+        pred_hist = deque(maxlen=5)
+        last_log_t = 0.0
+
+        # allow live threshold tuning
+        thr = float(prob_threshold)
+
         with mp_holistic.Holistic(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         ) as holistic:
 
-            log("Realtime recognition started. Press 'q' to quit.")
+            log("Realtime recognition started. Press 'q' to quit. ('t' - thr -0.05, 'y' +0.05)")
             while True:
                 ok, frame = cap.read()
                 if not ok:
@@ -387,6 +444,7 @@ class SignLanguageProcessor:
                 keypoints = extract_keypoints(results)
                 window.append(keypoints)
 
+                # draw landmarks (unchanged functionality)
                 if results.pose_landmarks:
                     mp_drawing.draw_landmarks(
                         image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
@@ -397,18 +455,7 @@ class SignLanguageProcessor:
                     mp_drawing.draw_landmarks(
                         image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
 
-                label_text = "…"
-                if len(window) == self.sequence_length:
-                    seq = np.expand_dims(np.array(window, dtype=np.float32), axis=0)
-                    probs = self.model.predict(seq, verbose=0)[0]
-                    top_idx = int(np.argmax(probs))
-                    top_prob = float(probs[top_idx])
-
-                    if top_prob >= prob_threshold:
-                        label_text = f"{self.actions[top_idx]}  ({top_prob*100:.1f}%)"
-                    else:
-                        label_text = f"Unsure ({top_prob*100:.1f}%)"
-
+                # FPS (unchanged)
                 if show_fps:
                     now = time.time()
                     dt = now - prev_time
@@ -417,26 +464,201 @@ class SignLanguageProcessor:
                     cv2.putText(image, f"FPS: {fps:.1f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                cv2.rectangle(image, (10, 50), (650, 90), (0, 0, 0), -1)
-                cv2.putText(image, label_text, (20, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+                # warm-up: wait until we have a full window
+                if len(window) < self.sequence_length:
+                    cv2.rectangle(image, (10, 50), (700, 95), (0, 0, 0), -1)
+                    cv2.putText(image, f"Collecting frames... {len(window)}/{self.sequence_length}",
+                                (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+                    cv2.imshow("FSL Realtime Recognition", image)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        break
+                    continue
 
+                # ---- PREDICT ----
+                seq = np.expand_dims(np.array(window, dtype=np.float32), axis=0)
+                probs = self.model.predict(seq, verbose=0)[0]
+
+                # sanitize probabilities
+                if not np.isfinite(probs).all():
+                    log("WARN: non-finite probabilities detected; sanitizing.")
+                    probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # top-k (3 on overlay, 5 in logs)
+                order = np.argsort(probs)[::-1]
+                topk = order[:3]
+                topk_probs = probs[topk]
+
+                # majority-vote smoothing for final label
+                pred_hist.append(int(topk[0]))
+                stable = max(set(pred_hist), key=pred_hist.count)
+                stable_votes = pred_hist.count(stable)
+
+                # final decision: need 3/5 votes AND pass threshold, else fallback to top-1 this frame
+                final_idx = int(stable) if (stable_votes >= 3 and probs[stable] >= thr) else int(topk[0])
+                final_conf = float(probs[final_idx])
+                final_label = self.actions[final_idx] if final_conf >= thr else "Unsure"
+
+                # ---- draw overlay (Top-3 + threshold indicator) ----
+                cv2.rectangle(image, (10, 50), (1000, 170), (0, 0, 0), -1)
+                cv2.putText(image, f"{final_label}",
+                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+
+                for i, (cls_idx, p) in enumerate(zip(topk, topk_probs), start=1):
+                    txt = f"{i}. {self.actions[int(cls_idx)]}: {p*100:.1f}%"
+                    cv2.putText(image, txt, (20, 110 + (i-1)*22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                cv2.putText(image, f"thr={thr:.2f}", (920, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # ---- terminal logs every ~0.5s ----
+                now_t = time.time()
+                if now_t - last_log_t >= 0.5:
+                    last_log_t = now_t
+                    top5 = order[:5]
+                    log(f"TOPK: {[(self.actions[int(i)], round(float(probs[i]),4)) for i in top5]} "
+                        f"| final=({final_label}, {final_conf:.3f}) thr={thr:.2f}")
+
+                # show frame
                 cv2.imshow("FSL Realtime Recognition", image)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+
+                # keys: quit / threshold up/down
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
+                elif key == ord('t'):
+                    thr = max(0.05, round(thr - 0.05, 2))
+                elif key == ord('y'):
+                    thr = min(0.95, round(thr + 0.05, 2))
 
         cap.release()
         cv2.destroyAllWindows()
         log("Realtime recognition ended.")
+
+
+    
+    def predict_one(self, action: str, vid_id: int):
+        """
+        Run inference on a single preprocessed sequence (no webcam).
+        `action` is the folder name, `vid_id` is the numeric id (e.g., 0, 1, 2...) of that video.
+        Prints Top-5 predictions with probabilities.
+        """
+        if self.model is None:
+            log("Load/train a model first (option 8 or 5)."); return
+        if not self.actions:
+            self.detect_actions_from_folders()
+        # sanity: output units must match class count
+        out_units = int(self.model.output_shape[-1])
+        if out_units != len(self.actions):
+            log(f"ERROR: model outputs {out_units} classes but actions has {len(self.actions)}. "
+                f"Check actions_order.txt alignment."); return
         
+        # build the (1, T, F) sequence from saved npy frames
+        seq = []
+        for pos in range(self.sequence_length):
+            path = os.path.join(self.mp_data_path, action, str(pos), f"{vid_id}.npy")
+            if not os.path.exists(path):
+                log(f"Missing frame file: {path}"); return
+            arr = np.load(path, allow_pickle=False).astype(np.float32, copy=False)
+            # pad/truncate safety
+            feat_dim = int(self.model.input_shape[-1])
+            if arr.size != feat_dim:
+                fixed = np.zeros(feat_dim, np.float32)
+                fixed[:min(feat_dim, arr.size)] = arr[:min(feat_dim, arr.size)]
+                arr = fixed
+            seq.append(arr)
+        seq = np.expand_dims(np.stack(seq, axis=0), axis=0)  # (1, T, F)
+
+        probs = self.model.predict(seq, verbose=0)[0]
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        order = np.argsort(probs)[::-1]
+        top5 = order[:5]
+        log(f"ONE SAMPLE → TOP5: {[(self.actions[int(i)], float(probs[i])) for i in top5]}")
+        top1 = int(top5[0])
+        log(f"TOP1: {self.actions[top1]} ({float(probs[top1])*100:.2f}%)")
+
+    def rebuild_labels_only(self):
+        """
+        Rebuild y_memmap.npy to realign labels with existing X_memmap.npy.
+        Assumes X was written in the same traversal order as prepare_training_data():
+        for each action in self.actions order, ids ascending.
+        """
+        X_path = os.path.join(self.mp_data_path, "X_memmap.npy")
+        y_path = os.path.join(self.mp_data_path, "y_memmap.npy")
+
+        if not os.path.exists(X_path):
+            log("X_memmap.npy missing. You must run 3.Prepare from scratch.")
+            return
+
+        # Load X just to get total rows
+        X = np.load(X_path, mmap_mode="r")
+        total_expected = int(X.shape[0])
+        n_classes = len(self.actions)
+        if n_classes == 0:
+            self.detect_actions_from_folders()
+            n_classes = len(self.actions)
+            if n_classes == 0:
+                log("No actions found. Aborting rebuild."); return
+
+        # Build label map and count how many rows we SHOULD write
+        label_map = {label: i for i, label in enumerate(self.actions)}
+        log(f"Rebuilding labels for {n_classes} classes...")
+        log(f"Label map sample: {list(label_map.items())[:10]} ...")
+
+        # Dry-run to compute target length from discovered ids
+        target_len = 0
+        per_action_counts = {}
+        for action in self.actions:
+            ids = self._discover_ids_for_action(action)
+            per_action_counts[action] = len(ids)
+            target_len += len(ids)
+
+        log(f"X rows: {total_expected} | sum(ids per action): {target_len}")
+        if target_len != total_expected:
+            log("WARNING: Length mismatch between X rows and discovered ids. "
+                "Labels may misalign. Consider full Prepare.")
+            # You can choose to abort here if you want strict safety:
+            # return
+
+        # Allocate fresh Y and write labels in the same traversal order
+        y_mm = np.lib.format.open_memmap(
+            y_path, dtype=np.int32, mode='w+', shape=(total_expected,)
+        )
+        y_mm[:] = -1
+
+        idx = 0
+        for action in self.actions:
+            lbl = label_map[action]
+            for _ in range(per_action_counts[action]):
+                if idx >= total_expected:
+                    break
+                y_mm[idx] = lbl
+                idx += 1
+
+        log(f"Rebuilt y_memmap: wrote {idx} labels (of {total_expected}).")
+        if np.any(y_mm == -1):
+            leftovers = int(np.sum(y_mm == -1))
+            log(f"WARNING: {leftovers} rows left as -1. X/Y misalignment likely.")
+
+        # Quick distribution check
+        vals, cnts = np.unique(y_mm, return_counts=True)
+        log(f"Labels present after rebuild: {vals.tolist()}")
+        log(f"Counts per label (first 10): {cnts.tolist()[:10]}")
+        log("Done rebuilding labels. Now retrain (5.Train).")
+        return y_path
+
+    
+        
+
 def main():
-    DATA_PATH = r"C:\Users\zhyrex\Desktop\cloning\Filipino_Sign_Data_Complete"
-    MP_DATA_PATH = r"C:\Users\zhyrex\Desktop\cloning\MP_Data"
-    processor = SignLanguageProcessor(DATA_PATH, MP_DATA_PATH)
+    DATA_PATH = r"C:\FSL Model\Filipino_Sign_Data_Complete"
+    MP_DATA_PATH = r"C:\FSL Model\MP_DATA"
+    processor = SignLanguageProcessor(DATA_PATH, MP_DATA_PATH) 
     X_path = y_cat = train_idx = test_idx = None
 
     while True:
-        print("\n1.Setup  2.Process  3.Prepare  4.Build  5.Train  6.Eval  7.Save  8.Load  9.Realtime  0.Exit")
+        print("\n1.Setup  2.Process  3.Prepare  4.Build  5.Train  6.Eval  7.Save  8.Load  9.Realtime  10.Test 11.Debug 12.RebuildY 0.Exit")
         c = input("Choice: ").strip()
         if c == '0':
             break
@@ -474,5 +696,51 @@ def main():
         elif c == '9':
             processor.run_realtime()
 
+        elif c == '10':
+            # --- Offline single-sample test (no webcam) ---
+            if processor.model is None:
+                log("Load or train a model first (8 or 5).")
+                continue
+
+            if not processor.actions:
+                processor.detect_actions_from_folders()
+                if not processor.actions:
+                    log("No actions found. Run 1.Setup or 2.Process → 3.Prepare first.")
+                    continue
+
+            act = input("Enter action name (folder): ").strip()
+            if not act:
+                log("No action entered."); continue
+            if act not in processor.actions:
+                log(f"Action '{act}' not in detected actions. Found: {len(processor.actions)} actions.")
+                continue
+
+            ids = processor._discover_ids_for_action(act)
+            if not ids:
+                log(f"No sample ids found for action '{act}'. Have you run 2.Process/3.Prepare?")
+                continue
+
+            vid_raw = input(f"Enter vid id (default {ids[0]}). Available count: {len(ids)}: ").strip()
+            try:
+                vid_id = int(vid_raw) if vid_raw else ids[0]
+            except:
+                vid_id = ids[0]
+
+            processor.predict_one(act, vid_id)
+
+        elif c == '11':
+            processor.dbg_check_model_vs_actions()
+            processor.dbg_label_distribution()
+            processor.dbg_data_health()
+
+        elif c == '12':
+            # Rebuild labels only (keep X)
+            if not processor.actions:
+                processor.detect_actions_from_folders()
+            processor.rebuild_labels_only()
+            # Verify distribution
+            processor.dbg_label_distribution()
+
+            processor.predict_one(act, vid_id)
 if __name__ == "__main__":
     main()

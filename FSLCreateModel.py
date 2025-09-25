@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import mediapipe as mp
 from collections import deque
-
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, multilabel_confusion_matrix
 import re
@@ -53,9 +53,12 @@ class SignLanguageProcessor:
         self.sequence_length = 30
 
     def detect_actions_from_folders(self):
-        self.actions = [d for d in os.listdir(self.data_path) if os.path.isdir(os.path.join(self.data_path, d))]
-        log(f"Detected actions: {self.actions}")
-        return np.array(self.actions)
+        actions = [d for d in os.listdir(self.data_path)
+                if os.path.isdir(os.path.join(self.data_path, d))]
+        actions = sorted(actions, key=natural_key)   # ← numeric-aware
+        self.actions = actions
+        log(f"Detected actions ({len(actions)}): {actions}")
+        return actions
 
     def setup_data_folders(self):
         os.makedirs(self.mp_data_path, exist_ok=True)
@@ -117,6 +120,29 @@ class SignLanguageProcessor:
 
         log("Finished processing all videos!")
         return True
+    
+    def _discover_ids_for_action(self, action):
+        """
+        Returns the sorted list of integer sample ids for a given action,
+        by looking under MP_DATA/<action>/0/*.npy
+        (we assume ids are numeric file stems: 0.npy, 1.npy, ...).
+        """
+        frame0 = os.path.join(self.mp_data_path, action, "0")
+        if not os.path.isdir(frame0):
+            return []
+        ids = []
+        for fname in os.listdir(frame0):
+            if fname.lower().endswith(".npy"):
+                stem, _ = os.path.splitext(fname)
+                try:
+                    ids.append(int(stem))
+                except ValueError:
+                    # skip non-numeric filenames
+                    pass
+        ids.sort()               # numeric ascending
+        if len(ids) > 1000:
+            ids = ids[:1000]     # keep your 1000-cap
+        return ids
 
     def prepare_training_data(self):
         if len(self.actions) == 0:
@@ -125,19 +151,21 @@ class SignLanguageProcessor:
                 log("No actions found for training!")
                 return None, None, None, None
 
-        # 🔥 ensure deterministic, numeric-aware order
+        # 1) Natural, deterministic order + persist
         self.actions = sorted(self.actions, key=natural_key)
-
-        # 🔥 persist actions order for inference/reload
         order_path = os.path.join(self.mp_data_path, "actions_order.txt")
+        os.makedirs(self.mp_data_path, exist_ok=True)
         with open(order_path, "w", encoding="utf-8") as f:
             f.write("\n".join(self.actions))
 
         label_map = {label: i for i, label in enumerate(self.actions)}
+        T = int(self.sequence_length)
+        F = 1662  # pose(33*4) + face(468*3) + LH(21*3) + RH(21*3)
 
+        # 2) Discover ids per action
         action_to_ids, total_expected = {}, 0
         for action in self.actions:
-            ids = self._discover_ids_for_action(action)
+            ids = self._discover_ids_for_action(action)  # single source of truth
             action_to_ids[action] = ids
             total_expected += len(ids)
 
@@ -145,91 +173,117 @@ class SignLanguageProcessor:
             log("No training data found! Run process_videos first.")
             return None, None, None, None
 
+        # 3) Define paths + sentinel
         X_path = os.path.join(self.mp_data_path, "X_memmap.npy")
         y_path = os.path.join(self.mp_data_path, "y_memmap.npy")
+        sentinel = np.iinfo(np.uint16).max
 
-        def _allocate_new_memmaps():
+        def _allocate_memmaps():
             X_mm = np.lib.format.open_memmap(
-                X_path, dtype=np.float32, mode='w+',
-                shape=(total_expected, self.sequence_length, 1662)
+                X_path, dtype=np.float32, mode="w+",
+                shape=(total_expected, T, F)
             )
             y_mm = np.lib.format.open_memmap(
-                y_path, dtype=np.int32, mode='w+',
+                y_path, dtype=np.uint16, mode="w+",
                 shape=(total_expected,)
             )
-            y_mm[:] = -1
+            y_mm[:] = sentinel
             return X_mm, y_mm
 
-        rebuild = False
-        if os.path.exists(X_path) and os.path.exists(y_path):
-            try:
-                X = np.load(X_path, mmap_mode="r+")
-                y = np.load(y_path, mmap_mode="r+")
-                if X.shape != (total_expected, self.sequence_length, 1662) or y.shape != (total_expected,):
-                    log("Memmap shapes mismatch current dataset — rebuilding memmaps...")
-                    rebuild = True
-                else:
-                    if np.all(y >= 0):
-                        log("Dataset already prepared — skipping Step 3 (using existing memmaps).")
-                        y_cat = to_categorical(y, num_classes=len(self.actions))
-                        idxs = np.arange(total_expected)
-                        train_idx, test_idx = train_test_split(idxs, test_size=0.05, random_state=42)
-                        return X_path, y_cat, train_idx, test_idx
-                    else:
-                        log("Resuming from existing (partially filled) memmaps...")
-            except Exception as e:
-                log(f"Could not open existing memmaps ({e}) — rebuilding...")
-                rebuild = True
+        def _pad_or_fix(arr, F, zeros):
+            if arr.size == F:
+                return arr
+            out = zeros.copy()
+            m = min(F, arr.size)
+            out[:m] = arr[:m]
+            return out
 
-            if rebuild:
-                try: os.remove(X_path)
-                except Exception: pass
-                try: os.remove(y_path)
-                except Exception: pass
-                X, y = _allocate_new_memmaps()
-        else:
-            X, y = _allocate_new_memmaps()
-
+        # 4) Reuse check (open read-only; explicitly close before rebuild)
+        X_try = None
+        y_try = None
         try:
-            start_idx = int(np.argmax(y == -1)) if np.any(y == -1) else y.shape[0]
-        except Exception:
-            start_idx = int(np.count_nonzero(y >= 0))
+            if os.path.exists(X_path) and os.path.exists(y_path):
+                X_try = np.load(X_path, mmap_mode="r")   # r => fewer locks
+                y_try = np.load(y_path, mmap_mode="r")
+                if (X_try.shape == (total_expected, T, F)
+                    and y_try.shape == (total_expected,)
+                    and np.all(y_try != sentinel)):
+                    log("Dataset already prepared — skipping Step 3 (using existing memmaps).")
+                    y_cat = to_categorical(y_try, num_classes=len(self.actions))
+                    idxs = np.arange(total_expected)
+                    # (optional but better) stratified split for balanced classes
+                    train_idx, test_idx = train_test_split(
+                        idxs, test_size=0.05, random_state=42, stratify=y_try
+                    )
+                    return X_path, y_cat, train_idx, test_idx
+                else:
+                    log("Memmaps exist but fail integrity checks — rebuilding.")
+        except Exception as e:
+            log(f"Could not open existing memmaps ({e}) — rebuilding.")
+        finally:
+            # On Windows, release MMAP handles *before* removing files
+            def _close_mmap(a):
+                try:
+                    if a is not None and hasattr(a, "_mmap") and a._mmap is not None:
+                        a._mmap.close()
+                except Exception:
+                    pass
+            _close_mmap(X_try); _close_mmap(y_try)
+            X_try = None; y_try = None
+            import gc; gc.collect()
 
-        idx = start_idx
+        # 5) (Re)create memmaps from scratch — files might still exist, remove safely
+        for p in (X_path, y_path):
+            if os.path.isdir(p):
+                raise RuntimeError(f"Expected file but found directory: {p}")
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to remove {p}: {e}")
+
+        X_mm, y_mm = _allocate_memmaps()
+
+        # 6) Fill data
+        idx = 0
+        zeros = np.zeros(F, dtype=np.float32)
         for action, ids in action_to_ids.items():
-            n = len(ids)
-            log(f"Preparing data for {n} videos of action: {action}")
+            if not ids:
+                continue
+            lbl = label_map[action]
+            log(f"Preparing data for {len(ids)} videos of action: {action}")
             for i, vid in enumerate(ids):
-                if idx < y.shape[0] and y[idx] != -1:
-                    idx += 1
-                    continue
-
-                window = []
-                for pos in range(self.sequence_length):
+                win = np.empty((T, F), dtype=np.float32)
+                for pos in range(T):
                     npy_path = os.path.join(self.mp_data_path, action, str(pos), f"{vid}.npy")
                     try:
-                        res = np.load(npy_path, allow_pickle=False).astype(np.float32, copy=False)
-                        if res.size != 1662:
-                            fixed = np.zeros(1662, dtype=np.float32)
-                            fixed[:min(1662, res.size)] = res[:min(1662, res.size)]
-                            res = fixed
+                        arr = np.load(npy_path, allow_pickle=False).astype(np.float32, copy=False)
+                        arr = _pad_or_fix(arr, F, zeros)
                     except Exception:
-                        res = np.zeros(1662, dtype=np.float32)
-                    window.append(res)
-
-                X[idx] = np.stack(window, axis=0)
-                y[idx] = label_map[action]
+                        arr = zeros
+                    win[pos] = arr
+                X_mm[idx] = win
+                y_mm[idx] = lbl
                 idx += 1
+                if (i + 1) % 100 == 0 or (i + 1) == len(ids):
+                    log(f"  Processed {i+1}/{len(ids)} videos")
 
-                if ((i + 1) % 100 == 0) or ((i + 1) == n):
-                    log(f"  Processed {i+1}/{n} videos")
+        # 7) Finalize + split
+        bad = int(np.sum(y_mm == sentinel))
+        if bad > 0:
+            log(f"ERROR: {bad} labels unfilled in y_memmap (sentinel={sentinel}).")
+            raise RuntimeError(f"{bad} labels unfilled in y_memmap. Please re-run Prepare.")
 
-        y_cat = to_categorical(y, num_classes=len(self.actions))
+        y_cat = to_categorical(y_mm, num_classes=len(self.actions))
         idxs = np.arange(total_expected)
-        train_idx, test_idx = train_test_split(idxs, test_size=0.05, random_state=42)
+        train_idx, test_idx = train_test_split(
+            idxs, test_size=0.05, random_state=42, stratify=y_mm
+        )
 
         log(f"Prepared {total_expected} sequences across {len(self.actions)} actions")
         return X_path, y_cat, train_idx, test_idx
+
+
 
 
 
@@ -240,20 +294,38 @@ class SignLanguageProcessor:
                 log("No actions found for model building!")
                 return None
         
-        log(f"Building model for {len(self.actions)} actions")
-        
+        log(f"Building optimized model for {len(self.actions)} actions")
+
         model = Sequential([
-            LSTM(64, return_sequences=True, activation='relu', input_shape=(self.sequence_length, 1662)),
-            LSTM(128, return_sequences=True, activation='relu'),
-            LSTM(64, return_sequences=False, activation='relu'),
+            Bidirectional(LSTM(128, return_sequences=True), input_shape=(self.sequence_length, 1662)),
+            BatchNormalization(),
+            Dropout(0.3),
+
+            Bidirectional(LSTM(128, return_sequences=True)),
+            BatchNormalization(),
+            Dropout(0.3),
+
+            Bidirectional(LSTM(64, return_sequences=False)),
+            BatchNormalization(),
+            Dropout(0.4),
+
+            Dense(128, activation='relu'),
+            Dropout(0.3),
             Dense(64, activation='relu'),
-            Dense(32, activation='relu'),
+            Dropout(0.3),
+
             Dense(len(self.actions), activation='softmax')
         ])
-        model.compile(optimizer='Adam', loss='categorical_crossentropy', metrics=['categorical_accuracy'])
-        self.model = model
-        log("Model built successfully")
-        return model
+
+        model.compile(
+            optimizer='Adam',
+            loss='categorical_crossentropy',
+            metrics=['categorical_accuracy']
+        )
+
+    self.model = model
+    log("✅ Optimized model built successfully")
+    return model
 
     def train_model(self, X_path, y_cat, train_idx, test_idx, epochs=200, batch_size=32):
         X_mem = np.load(X_path, mmap_mode='r')
@@ -371,6 +443,11 @@ class SignLanguageProcessor:
         log(f"Model output units: {out_units}, actions: {len(self.actions)}")
         if out_units != len(self.actions):
             log("❌ Mismatch — labels/order problem.")
+        if self.model.output_shape[-1] != len(self.actions):
+            raise ValueError(
+                f"Model output {self.model.output_shape[-1]} classes "
+                f"≠ {len(self.actions)} actions. Rebuild Prepare+Build."
+            )
 
     def dbg_label_distribution(self):
         y_path = os.path.join(self.mp_data_path, "y_memmap.npy")
@@ -623,9 +700,9 @@ class SignLanguageProcessor:
 
         # Allocate fresh Y and write labels in the same traversal order
         y_mm = np.lib.format.open_memmap(
-            y_path, dtype=np.int32, mode='w+', shape=(total_expected,)
+            y_path, dtype=np.uint16, mode='w+', shape=(total_expected,)
         )
-        y_mm[:] = -1
+        y_mm[:] = np.iinfo(np.uint16).max  # 65535 = empty
 
         idx = 0
         for action in self.actions:
@@ -637,9 +714,10 @@ class SignLanguageProcessor:
                 idx += 1
 
         log(f"Rebuilt y_memmap: wrote {idx} labels (of {total_expected}).")
-        if np.any(y_mm == -1):
-            leftovers = int(np.sum(y_mm == -1))
-            log(f"WARNING: {leftovers} rows left as -1. X/Y misalignment likely.")
+        sentinel = np.iinfo(np.uint16).max
+        if np.any(y_mm == sentinel):
+            leftovers = int(np.sum(y_mm == sentinel))
+            log(f"WARNING: {leftovers} rows left as sentinel ({sentinel}). X/Y misalignment likely.")
 
         # Quick distribution check
         vals, cnts = np.unique(y_mm, return_counts=True)
@@ -740,7 +818,5 @@ def main():
             processor.rebuild_labels_only()
             # Verify distribution
             processor.dbg_label_distribution()
-
-            processor.predict_one(act, vid_id)
 if __name__ == "__main__":
     main()

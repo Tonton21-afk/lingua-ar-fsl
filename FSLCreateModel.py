@@ -323,9 +323,9 @@ class SignLanguageProcessor:
             metrics=['categorical_accuracy']
         )
 
-    self.model = model
-    log("✅ Optimized model built successfully")
-    return model
+        self.model = model
+        log("✅ Optimized model built successfully")
+        return model
 
     def train_model(self, X_path, y_cat, train_idx, test_idx, epochs=200, batch_size=32):
         X_mem = np.load(X_path, mmap_mode='r')
@@ -469,9 +469,33 @@ class SignLanguageProcessor:
 
 
     
-    def run_realtime(self, model_path='None', prob_threshold=0.60, show_fps=True):
+    def run_realtime(
+        self,
+        model_path=None,                 # was 'None' (string). Using real None prevents accidental file loads.
+        prob_threshold: float = 0.60,
+        show_fps: bool = True,
+        camera_index: int = 0,           # new: let you pick external webcams (try 1 if 0 fails)
+        frame_size: tuple = (960, 540),  # new: safe default; tune for FPS/clarity (e.g., (640, 480) for speed)
+        hist_k: int = 5,                 # new: smoothing window; default matches your current behavior
+        vote_k: int = 3,                 # new: number of votes required to accept the stable class (was implicit 3/5)
+        min_det_conf: float = 0.50,      # new: expose Mediapipe thresholds for quick tuning
+        min_track_conf: float = 0.50,
+        log_interval: float = 0.50,      # new: keep your ~0.5s logs configurable
+        softmax_safety: bool = False     # new: only enable if your final layer isn’t softmax
+    ):
+        """
+        Constraints (example placeholders — adapt to your actual needs):
+        - Must run on CPU-only laptops with integrated GPU.
+        - Maintain latency <= 100ms per frame at 640x480 on i5/R5-class CPUs.
+        - Keep memory below 1.5 GB while running.
+        Performance Targets (example placeholders):
+        - Realtime ≥ 12 FPS at 640x480, ≥ 8 FPS at 960x540.
+        - Online accuracy (smoothed TOP1) ≥ 90% on in-the-wild tests.
+        """
+
+        # 1) Model load: fix default and avoid loading "None" path by accident
         if self.model is None:
-            if model_path:
+            if model_path is not None:
                 try:
                     self.model = load_model(model_path)
                     log(f"Loaded model for realtime from: {model_path}")
@@ -479,9 +503,10 @@ class SignLanguageProcessor:
                     log(f"Failed to load model at {model_path}: {e}")
                     return
             else:
-                log("No model in memory. Load or train a model first.")
+                log("No model in memory. Load or train a model first, or pass model_path.")
                 return
 
+        # 2) Ensure actions (labels) exist and align later
         if not self.actions:
             self.detect_actions_from_folders()
             if not self.actions:
@@ -491,59 +516,68 @@ class SignLanguageProcessor:
         from collections import deque
         window = deque(maxlen=self.sequence_length)
 
-        cap = cv2.VideoCapture(0)
+        # 3) Camera init with index + resolution
+        cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
-            log("Cannot open webcam.")
+            log(f"Cannot open webcam index {camera_index}. Try camera_index=1.")
             return
+        if frame_size and len(frame_size) == 2:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_size[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_size[1])
 
+        # 4) FPS state (moving average)
         prev_time = time.time()
+        fps_hist = deque(maxlen=20)
         fps = 0.0
 
-        # smoothing + logging state
-        pred_hist = deque(maxlen=5)
+        # 5) smoothing + logging state (configurable)
+        pred_hist = deque(maxlen=hist_k)
         last_log_t = 0.0
 
-        # allow live threshold tuning
+        # 6) live threshold tuning
         thr = float(prob_threshold)
 
         with mp_holistic.Holistic(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=min_det_conf,
+            min_tracking_confidence=min_track_conf
         ) as holistic:
 
-            log("Realtime recognition started. Press 'q' to quit. ('t' - thr -0.05, 'y' +0.05)")
+            log("Realtime recognition started. Press 'q' to quit. ('t' thr-0.05, 'y' thr+0.05)")
             while True:
                 ok, frame = cap.read()
                 if not ok:
                     break
 
+                # Optional resize for speed/clarity consistency (keeps capture size)
+                if frame_size:
+                    frame = cv2.resize(frame, frame_size)
+
                 image, results = mediapipe_detection(frame, holistic)
                 keypoints = extract_keypoints(results)
                 window.append(keypoints)
 
-                # draw landmarks (unchanged functionality)
+                # Draw landmarks (unchanged functionality)
                 if results.pose_landmarks:
-                    mp_drawing.draw_landmarks(
-                        image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
+                    mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
                 if results.left_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                    mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
                 if results.right_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                    mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
 
-                # FPS (unchanged)
+                # FPS (moving average)
                 if show_fps:
                     now = time.time()
                     dt = now - prev_time
                     prev_time = now
-                    fps = 1.0 / dt if dt > 0 else fps
+                    if dt > 0:
+                        fps_hist.append(1.0 / dt)
+                        fps = sum(fps_hist) / max(1, len(fps_hist))
                     cv2.putText(image, f"FPS: {fps:.1f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                # warm-up: wait until we have a full window
+                # Warm-up: wait until we have a full window
                 if len(window) < self.sequence_length:
-                    cv2.rectangle(image, (10, 50), (700, 95), (0, 0, 0), -1)
+                    # cv2.rectangle(image, (10, 50), (1000, 65), (0, 0, 0), -1)
                     cv2.putText(image, f"Collecting frames... {len(window)}/{self.sequence_length}",
                                 (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
                     cv2.imshow("FSL Realtime Recognition", image)
@@ -556,10 +590,27 @@ class SignLanguageProcessor:
                 seq = np.expand_dims(np.array(window, dtype=np.float32), axis=0)
                 probs = self.model.predict(seq, verbose=0)[0]
 
-                # sanitize probabilities
+                # Optional safety softmax if model head is not softmax
+                if softmax_safety:
+                    if (probs.ndim == 1) and (np.any(probs < 0) or np.max(probs) > 1.0 or np.sum(probs) <= 0.0):
+                        ex = np.exp(probs - np.max(probs))
+                        denom = np.clip(np.sum(ex), 1e-8, None)
+                        probs = ex / denom
+
+                # Sanitize probabilities
                 if not np.isfinite(probs).all():
                     log("WARN: non-finite probabilities detected; sanitizing.")
                     probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # Ensure label/prob alignment (guard if length mismatch ever occurs)
+                num_classes = len(self.actions)
+                if probs.shape[0] != num_classes:
+                    # Clamp or pad for robustness; better to fix upstream if this triggers.
+                    if probs.shape[0] > num_classes:
+                        probs = probs[:num_classes]
+                    else:
+                        pad = np.zeros((num_classes - probs.shape[0],), dtype=probs.dtype)
+                        probs = np.concatenate([probs, pad], axis=0)
 
                 # top-k (3 on overlay, 5 in logs)
                 order = np.argsort(probs)[::-1]
@@ -568,30 +619,61 @@ class SignLanguageProcessor:
 
                 # majority-vote smoothing for final label
                 pred_hist.append(int(topk[0]))
+                # votes for the most frequent class in the window
                 stable = max(set(pred_hist), key=pred_hist.count)
                 stable_votes = pred_hist.count(stable)
 
-                # final decision: need 3/5 votes AND pass threshold, else fallback to top-1 this frame
-                final_idx = int(stable) if (stable_votes >= 3 and probs[stable] >= thr) else int(topk[0])
+                # final decision: need vote_k/hist_k votes AND pass threshold; else fallback to top-1 this frame
+                final_idx = int(stable) if (stable_votes >= vote_k and probs[stable] >= thr) else int(topk[0])
                 final_conf = float(probs[final_idx])
                 final_label = self.actions[final_idx] if final_conf >= thr else "Unsure"
 
                 # ---- draw overlay (Top-3 + threshold indicator) ----
-                cv2.rectangle(image, (10, 50), (1000, 170), (0, 0, 0), -1)
-                cv2.putText(image, f"{final_label}",
-                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+               # ---- draw overlay (Final label + Top-3 + threshold) ----
 
+                # get frame size for positioning
+                h, w = image.shape[:2]
+                left = 20
+                base_y = h - 120  # start near bottom to avoid face area
+                line_h = 28
+
+                # helper: draw text with background box
+                def draw_text_with_bg(img, text, pos, font, scale, color, thickness, bg_color=(0,0,0), alpha=0.5):
+                    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+                    x, y = pos
+                    # background rectangle coords
+                    x1, y1 = x-6, y-th-6
+                    x2, y2 = x+tw+6, y+6
+                    overlay = img.copy()
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), bg_color, -1)
+                    cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, img)
+                    cv2.putText(img, text, (x, y), font, scale, color, thickness)
+
+                # 1) Final label (big, cyan)
+                final_text = f"{final_label}"
+                draw_text_with_bg(image, final_text, (left, base_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                                (255, 255, 0), 2)
+
+                # 2) Top-3 predictions (smaller, white)
                 for i, (cls_idx, p) in enumerate(zip(topk, topk_probs), start=1):
                     txt = f"{i}. {self.actions[int(cls_idx)]}: {p*100:.1f}%"
-                    cv2.putText(image, txt, (20, 110 + (i-1)*22),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    draw_text_with_bg(image, txt,
+                                    (left, base_y + i*line_h),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (255, 255, 255), 2)
 
-                cv2.putText(image, f"thr={thr:.2f}", (920, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                # 3) Threshold indicator (top-right, small)
+                thr_txt = f"thr={thr:.2f}"
+                (tx, ty) = (w - 150, 40)
+                draw_text_with_bg(image, thr_txt, (tx, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (255, 255, 255), 2)
 
-                # ---- terminal logs every ~0.5s ----
+
+                # ---- terminal logs every ~log_interval s ----
                 now_t = time.time()
-                if now_t - last_log_t >= 0.5:
+                if now_t - last_log_t >= log_interval:
                     last_log_t = now_t
                     top5 = order[:5]
                     log(f"TOPK: {[(self.actions[int(i)], round(float(probs[i]),4)) for i in top5]} "
@@ -612,6 +694,7 @@ class SignLanguageProcessor:
         cap.release()
         cv2.destroyAllWindows()
         log("Realtime recognition ended.")
+
 
 
     

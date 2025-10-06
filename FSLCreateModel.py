@@ -1,4 +1,5 @@
 import os, cv2, time, math, random, re
+import shutil
 import numpy as np
 import pandas as pd
 import mediapipe as mp
@@ -266,7 +267,7 @@ class SignLanguageProcessor:
     def add_data_augmentation(self):
         """Augment saved frames on disk (noise, temporal shift, spatial shift)."""
         log("Starting data augmentation...")
-        aug_techniques = ['noise', 'temporal_shift', 'spatial_shift']
+        aug_techniques = ['noise', 'temporal_shift', 'spatial_shift',]
 
         for action in self.actions:
             ids = self._discover_ids_for_action(action)
@@ -738,7 +739,7 @@ class SignLanguageProcessor:
         prob_threshold: float = 0.60,
         show_fps: bool = True,
         camera_index: int = 0,
-        frame_size: tuple = (960, 540),
+        frame_size: tuple = (640, 480),
         hist_k: int = 7,
         vote_k: int = 4,
         min_det_conf: float = 0.50,
@@ -1087,6 +1088,7 @@ class SignLanguageProcessor:
         log("Enhanced pipeline completed successfully!")
         return True
     
+    
     def check_augmentation_coverage(self):
         """Verify augmentation is properly included"""
         log("=== AUGMENTATION CHECK ===")
@@ -1097,7 +1099,9 @@ class SignLanguageProcessor:
                 continue
                 
             files = [f for f in os.listdir(frame0) if f.endswith('.npy')]
-            original_files = [f for f in files if not '_' in f]
+            
+            # Consistent underscore-based detection
+            original_files = [f for f in files if '_' not in f]
             augmented_files = [f for f in files if '_' in f]
             
             log(f"{action}: {len(original_files)} originals, {len(augmented_files)} augmented")
@@ -1105,11 +1109,85 @@ class SignLanguageProcessor:
             # Show augmentation types
             aug_types = set()
             for f in augmented_files:
-                aug_type = f.split('_')[-1].split('.')[0]
-                aug_types.add(aug_type)
+                # Extract everything between first underscore and .npy
+                base_name = f.replace('.npy', '')
+                if '_' in base_name:
+                    aug_type = base_name.split('_', 1)[1]  # Get everything after first underscore
+                    aug_types.add(aug_type)
             
             if aug_types:
                 log(f"  Augmentation types: {sorted(aug_types)}")
+                
+
+
+
+def integrate_augmented_as_numeric(mp_data_path, actions, T=30):
+    """FIXED: Groups 30 frames of each augmented video as one sequence"""
+    log("Integrating augmented files into training dataset...")
+    total_integrated = 0
+    
+    for action in actions:
+        action_path = os.path.join(mp_data_path, action)
+        if not os.path.isdir(action_path):
+            continue
+            
+        # Find maximum existing numeric ID by checking frame 0
+        frame0_path = os.path.join(action_path, "0")
+        max_id = -1
+        if os.path.exists(frame0_path):
+            for fname in os.listdir(frame0_path):
+                if fname.endswith('.npy'):
+                    base_name = fname.replace('.npy', '')
+                    if base_name.isdigit():
+                        max_id = max(max_id, int(base_name))
+        
+        next_id = max_id + 1
+        integrated_this_action = 0
+        
+        # Find unique augmented sequences by checking frame 0
+        frame0_path = os.path.join(action_path, "0")
+        if not os.path.exists(frame0_path):
+            continue
+            
+        # Get all augmented files from frame 0 (these represent unique sequences)
+        aug_files_frame0 = [f for f in os.listdir(frame0_path) 
+                           if f.endswith('.npy') and '_' in f]
+        
+        # Group by base augmented sequence (remove frame-specific processing)
+        unique_aug_sequences = set()
+        for aug_file in aug_files_frame0:
+            base_name = aug_file.replace('.npy', '')
+            unique_aug_sequences.add(base_name)  # e.g., "0_noise", "0_temporal_shift"
+        
+        # Integrate each unique augmented sequence
+        for aug_sequence_name in sorted(unique_aug_sequences):
+            new_id = next_id
+            
+            # Copy all 30 frames for this augmented sequence
+            frames_copied = 0
+            for pos in range(T):
+                src_file = os.path.join(action_path, str(pos), f"{aug_sequence_name}.npy")
+                dst_file = os.path.join(action_path, str(pos), f"{new_id}.npy")
+                
+                if os.path.exists(src_file):
+                    shutil.copy2(src_file, dst_file)
+                    frames_copied += 1
+            
+            if frames_copied > 0:
+                integrated_this_action += 1
+                total_integrated += 1
+                next_id += 1
+                log(f"  Integrated {aug_sequence_name} → {new_id} ({frames_copied}/30 frames)")
+        
+        if integrated_this_action > 0:
+            log(f"  {action}: Integrated {integrated_this_action} augmented sequences")
+    
+    log(f"Integration complete! Total: {total_integrated} augmented sequences")
+    return total_integrated
+
+
+
+
 
 
 # -------------------- CLI --------------------
@@ -1124,7 +1202,7 @@ def main():
     X_path = y_cat = train_idx = test_idx = None
 
     while True:
-        print("\n1.Setup  2.Process  3.Prepare  4.Build  5.Train  6.Eval  7.Save  8.Load  9.Realtime  10.Test 11.Debug 12.RebuildY 13.EnhancedPipeline 14. augementation check sah 15. Add augmentation 0.Exit")
+        print("\n1.Setup  2.Process  3.Prepare  4.Build  5.Train  6.Eval  7.Save  8.Load  9.Realtime  10.Test 11.Debug 12.RebuildY 13.EnhancedPipeline 14.Augmentation Check 15.Add Augmentation 16.Integration 17.Cleanup Duplicates 18.Optimized Realtime 0.Exit")
         c = input("Choice: ").strip()
         if c == '0':
             break
@@ -1199,20 +1277,96 @@ def main():
             processor.enhanced_pipeline()
         elif c == '14':
             processor.check_augmentation_coverage()
-        # in your menu loop:
-        elif c == '15':  # Add Aug
+        elif c == '15':  # Add Augmentation
             if not processor.actions:
                 processor.detect_actions_from_folders()
-            processor.add_data_augmentation()          # <- creates files like 12_noise.npy, etc.
+            processor.add_data_augmentation()
             log("Augmentation done. Press 14 to verify.")
-
-        elif c == '16':  # Integrate Aug -> numeric IDs
-            import os
+        elif c == '16':  # Integration
+            if not processor.actions:
+                processor.detect_actions_from_folders()
             ACTIONS = [d for d in os.listdir(processor.mp_data_path)
                     if os.path.isdir(os.path.join(processor.mp_data_path, d)) and d != "logs"]
             integrate_augmented_as_numeric(processor.mp_data_path, ACTIONS, T=processor.sequence_length)
             log("Integrated augmented files into numeric IDs. Now run 3→4→5.")
+        elif c == '17':  # Cleanup Duplicates
+            if not processor.actions:
+                processor.detect_actions_from_folders()
+            ACTIONS = [d for d in os.listdir(processor.mp_data_path)
+                    if os.path.isdir(os.path.join(processor.mp_data_path, d)) and d != "logs"]
+            cleanup_duplicates(processor.mp_data_path, ACTIONS, T=processor.sequence_length)
+            log("Cleanup completed. Run 14 to check current counts.")
+        elif c == '18':  # Optimized Realtime
+            processor.run_optimized_realtime()
+        
 
+# Add these functions to your SignLanguageProcessor class or as standalone functions:
+
+def cleanup_duplicates(mp_data_path, actions, T=30):
+    """Remove duplicate sequences created by integration bugs"""
+    log("Cleaning up duplicate sequences...")
+    total_removed = 0
+    
+    for action in actions:
+        action_path = os.path.join(mp_data_path, action)
+        
+        # Find all numeric files in frame 0
+        frame0_path = os.path.join(action_path, "0")
+        if not os.path.exists(frame0_path):
+            continue
+            
+        files = [f for f in os.listdir(frame0_path) if f.endswith('.npy')]
+        numeric_files = [f for f in files if f.replace('.npy', '').isdigit()]
+        numeric_ids = [int(f.replace('.npy', '')) for f in numeric_files]
+        
+        if not numeric_ids:
+            continue
+            
+        # Expected: 0-49 (originals) + 200-349 (integrated) = 200 total
+        # If we have more than 200, we have duplicates
+        max_id = max(numeric_ids)
+        if max_id <= 349 and len(numeric_ids) <= 200:  # This is correct
+            log(f"  {action}: OK - {len(numeric_ids)} sequences")
+            continue
+            
+        # We have duplicates beyond 349 or too many files
+        expected_ids = set(range(50)) | set(range(200, 350))  # 0-49 + 200-349
+        current_ids = set(numeric_ids)
+        duplicates = current_ids - expected_ids
+        
+        if duplicates:
+            log(f"  {action}: {len(duplicates)} duplicates found (IDs {sorted(duplicates)})")
+            
+            # Remove duplicates
+            for dup_id in duplicates:
+                for pos in range(T):
+                    file_path = os.path.join(action_path, str(pos), f"{dup_id}.npy")
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        total_removed += 1
+            
+            log(f"  {action}: Removed {len(duplicates)} duplicate sequences")
+        else:
+            log(f"  {action}: {len(numeric_ids)} sequences (expected 200)")
+    
+    log(f"Cleanup complete! Total files removed: {total_removed}")
+
+def run_optimized_realtime(self):
+    """Optimized realtime with better detection parameters"""
+    log("Starting OPTIMIZED realtime detection...")
+    return self.run_realtime(
+        prob_threshold=0.40,           # Lower threshold for testing
+        frame_size=(640, 480),         # Balanced resolution for performance
+        hist_k=15,                     # More history frames for stability
+        vote_k=8,                      # Stricter voting for accuracy
+        min_det_conf=0.7,              # Higher detection confidence
+        min_track_conf=0.7,            # Higher tracking confidence
+        log_interval=1.0               # Less frequent logging
+        # Removed smoothing_factor - it doesn't exist in your method
+    )
+
+# Add the method to your SignLanguageProcessor class
+SignLanguageProcessor.run_optimized_realtime = run_optimized_realtime
 
 if __name__ == "__main__":
     main()
